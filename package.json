@@ -1,0 +1,17 @@
+{
+  "name": "mckelvey-ai-scheduler",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "ollama": "^0.5.15",
+    "openai": "^4.98.0",
+    "zod": "^3.24.3",
+    "zod-to-json-schema": "^3.24.5"
+  }
+}
