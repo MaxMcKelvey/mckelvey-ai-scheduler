@@ -17,6 +17,11 @@ const TaskSchema = z.object({
     parentId: z.number(),
     description: z.string(),
     priority: z.enum(["low", "medium", "high"]),
+    work_ledger: z.array(z.object({
+        work_summary: z.string(),
+    })),
+    requirements_for_success: z.string(),
+    completed: z.boolean(),
 });
 type Task = z.infer<typeof TaskSchema>;
 
@@ -75,17 +80,28 @@ async function writeTasks(tasks: Task[]) {
     await writeWorkFile("tasks.json", JSON.stringify(tasks, null, 2));
 }
 
+const compareTaskPriority = (a: Task, b: Task) => {
+    const priorityOrder = ["low", "medium", "high"];
+    return priorityOrder.indexOf(a.priority) - priorityOrder.indexOf(b.priority);
+}
+
 async function getTaskList(taskStack: number[]) {
     const tasks = await readTasks();
     if (taskStack.length > 0) {
-        return tasks.filter((task) => task.parentId === taskStack[taskStack.length - 1]);
+        return tasks
+            .filter((task) => task.parentId === taskStack[taskStack.length - 1])
+            .filter((task) => task.completed === false)
+            .sort(compareTaskPriority);
     }
-    return tasks;
+    return tasks
+        .filter((task) => task.completed === false)
+        .sort(compareTaskPriority);
 }
 
 const SubtaskResponseSchema = z.array(z.object({
     subtask: z.string(),
     priority: z.enum(["low", "medium", "high"]),
+    requirements_for_success: z.string(),
 }));
 type SubtaskResponse = z.infer<typeof SubtaskResponseSchema>;
 
@@ -122,21 +138,198 @@ Subtasks should reflect a clear plan to achieve the parent task. Return your ans
 
     const parsedResponse = SubtaskResponseSchema.parse(JSON.parse(response.message.content));
 
-    const subtasks = parsedResponse.map((subtask) => {
+    const subtasks: Task[] = parsedResponse.map((subtask) => {
         taskNum++;
         return {
             id: taskNum,
             parentId: task.id,
             description: subtask.subtask,
             priority: subtask.priority,
+            work_ledger: [],
+            completed: false,
+            requirements_for_success: subtask.requirements_for_success,
         };
     });
 
     return subtasks;
 }
 
-async function processTask(task: Task) {
+const TaskProcessSchema = z.discriminatedUnion("type", [
+    z.object({
+        type: z.literal("subtasks"),
+        ready: z.literal(true),
+        subtasks: z.array(z.object({
+            // title: z.string(),
+            task_description: z.string(),
+            requirements_for_success: z.string(),
+            priority: z.enum(["low", "medium", "high"]),
+            // prerequisites: z.array(z.string()),
+        })),
+    }),
+    z.object({
+        type: z.literal("executePrompt"),
+        ready: z.literal(true),
+        executePrompt: z.object({
+            prompt: z.string(),
+            // expectedOutput: z.string(),
+            // context: z.string().optional(),
+        }),
+    }),
+    z.object({
+        type: z.literal("notReady"),
+        ready: z.literal(false),
+        missingDependencies: z.array(z.string()).optional(),
+        reason: z.string(),
+    }),
+]);
+type TaskProcess = z.infer<typeof TaskProcessSchema>;
+
+async function preProcessTask(task: Task) {
     // TODO: Implement the task processing logic
+    const response = await openai.responses.parse({
+        model: "gpt-4o-mini",
+        input: [
+            {
+                role: "system",
+                content: `You are an AI agent responsible for managing and preparing individual tasks.
+
+Task Description:
+"${task.description}"
+
+Work already done:
+"${task.work_ledger.map((work) => work.work_summary).join("\n")}"
+
+Your job is to:
+
+Check if the task is ready to execute.
+
+If not, explain what's missing.
+
+If the task is too large, break it into subtasks with dependencies.
+
+If ready, generate a final prompt suitable for a language model to execute.
+
+Return your response as a JSON object matching this schema:
+                `,
+            },
+            {
+                role: "user",
+                content: "Is this task ready? If so, generate the next steps to take.",
+            },
+        ],
+        text: {
+            format: zodTextFormat(TaskProcessSchema, "output")
+        }
+    });
+
+    const output = response.output_parsed;
+    if (!output) {
+        throw new Error("No output from the model");
+    }
+    const parsedOutput = TaskProcessSchema.parse(output);
+
+    return parsedOutput;
+}
+
+const PostProcessDecisionSchema = z.object({
+    status: z.enum(["complete", "continue", "defer"]),
+    reason: z.string().optional(),
+});
+
+async function postProcessTask(task: Task) {
+    // Figure out if:
+    // 1. The task has been completed
+    // 2. We should continue to work on the task
+    // 3. We should move on to the next task, and come back to this task later
+
+    const response = await ollama.chat({
+        model: "gemma3:1b", // or upgrade to something like "mistral:7b" for better judgment
+        messages: [
+          {
+            role: "system",
+            content: `
+You are a task manager AI responsible for evaluating the state of a completed or partially completed task.
+
+You must return a structured JSON decision in one of three categories:
+- "complete" → The task is done, and no further work is needed.
+- "continue" → The task is in progress, and additional steps or refinements are needed before marking it complete.
+- "defer" → The task is currently blocked, and should be returned to later (e.g. due to missing context, upstream dependency, or priority shift).
+
+Only return the structured result.
+`
+        },
+        {
+            role: "user",
+            content: `
+Task Description: ${task.description}
+Work already done: ${task.work_ledger.map((work) => work.work_summary).join("\n")}
+
+What do you think?
+`
+            },
+        ],
+        format: zodToJsonSchema(PostProcessDecisionSchema)
+    });
+    
+    return PostProcessDecisionSchema.parse(JSON.parse(response.message.content));
+}
+
+async function processTask(task: Task, taskStack: number[]) {
+    const preProcess = await preProcessTask(task);
+    if (preProcess.type === "notReady") {
+        return { next: true };
+    }
+    if (preProcess.type === "subtasks") {
+        // create the subtasks
+        const subtasks: Task[] = preProcess.subtasks.map((subtask) => {
+            taskNum++;
+            return {
+                id: taskNum,
+                parentId: task.id,
+                description: subtask.task_description,
+                priority: subtask.priority,
+                work_ledger: [],
+                completed: false,
+                requirements_for_success: subtask.requirements_for_success,
+            };
+        });
+
+        // save the subtasks
+        const currentTasks = await readTasks();
+        await writeTasks([...currentTasks, ...subtasks]);
+
+        // add current task to the task stack
+        taskStack.push(task.id);
+        return { next: true };
+    }
+    if (preProcess.type === "executePrompt") {
+        // execute the prompt
+        const output = await executePrompt(preProcess.executePrompt.prompt, task.work_ledger.map((work) => work.work_summary).join("\n"));
+        
+        // update the task with the new work that was done
+        const currentTasks = await readTasks();
+        const updatedTask = currentTasks.find((t) => t.id === task.id);
+        if (updatedTask) {
+            updatedTask.work_ledger.push({ work_summary: output });
+            await writeTasks([...currentTasks]);
+        }
+    }
+    // do post processing
+    const postProcess = await postProcessTask(task);
+    if (postProcess.status === "complete") {
+        // mark the task as completed
+        const currentTasks = await readTasks();
+        const updatedTask = currentTasks.find((t) => t.id === task.id);
+        if (updatedTask) {
+            updatedTask.completed = true;
+            await writeTasks([...currentTasks]);
+        }
+        return { next: true };
+    }
+    if (postProcess.status === "defer") {
+        return { next: true };
+    }
+    return { next: false };
 }
 
 async function getContext(prompt: string) {
@@ -224,7 +417,7 @@ const TextOutputSchema = z.object({
 });
 type TextOutput = z.infer<typeof TextOutputSchema>;
 
-async function executePrompt(prompt: string) {
+async function executePrompt(prompt: string, workSummary: string) {
     // get the context
     const context = await getContext(prompt);
 
@@ -240,6 +433,8 @@ async function executePrompt(prompt: string) {
                 role: "system",
                 content: `
                 Here is the context for your task: ${context}
+
+                Here is the work that has already been done: ${workSummary}
                 
                 `,
             },
@@ -274,6 +469,9 @@ async function main() {
         parentId: 0,
         description: "Write a blog post about the benefits of using AI to plan tasks",
         priority: "high",
+        work_ledger: [],
+        completed: false,
+        requirements_for_success: "The blog post should be written in a way that is easy to understand and follow.",
     });
     console.log(subtasks);
 }
