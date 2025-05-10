@@ -49,6 +49,13 @@ async function readWorkFile(fileName: string) {
 }
 
 async function writeWorkFile(fileName: string, content: string) {
+    if (fileName.includes("/")) {
+        const dirPath = fileName.split("/").slice(0, -1).join("/");
+        await mkdir("./work/" + dirPath, { recursive: true });
+    }
+    if (!fileName.includes(".")) {
+        fileName += ".md";
+    }
     await writeFile("./work/" + fileName, content);
 }
 
@@ -258,58 +265,6 @@ async function executePrompt(prompt: string) {
     return parsedOutput.summary_of_work_done;
 }
 
-const APromptSchema = z.discriminatedUnion("type", [
-    z.object({
-        type: z.literal("context"),
-        context: z.string(),
-    }),
-    z.object({
-        type: z.literal("tasks"),
-        tasks: z.array(z.object({
-            title: z.string(),
-            description: z.string(),
-            dependencies: z.array(z.string()).optional(),
-            outputTarget: z.string().optional(),
-        })),
-    }),
-    z.object({
-        type: z.literal("output"),
-        location: z.string(),
-    }),
-]);
-type APrompt = z.infer<typeof APromptSchema>;
-
-async function categorizeAPrompt(prompt: string) {
-    const response = await ollama.chat({
-        model: "gemma3:1b",
-        messages: [
-        {
-            role: "system",
-            content: ``
-        },
-        {
-            role: "user",
-            content: prompt
-        }
-        ],
-        format: zodToJsonSchema(APromptSchema)
-    });
-
-    return JSON.parse(response.message.content) as APrompt;
-}
-
-async function processAPrompt(prompt: string) {
-    const parsedPrompt = await categorizeAPrompt(prompt);
-    switch (parsedPrompt.type) {
-        case "context":
-            return parsedPrompt.context;
-        case "tasks":
-            return parsedPrompt.tasks;
-        case "output":
-            return parsedPrompt.location;
-    }
-}
-    
 async function main() {
     await createWorkDir();
     const taskStack = [];
